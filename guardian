@@ -1,0 +1,408 @@
+#!/bin/bash
+# Guardian - CLI tool for managing command protections
+# Add is free, Remove requires password
+# Wrapper files are root-owned
+
+GUARDIAN_DIR="/etc/guardian"
+CONFIG="$GUARDIAN_DIR/config"
+RULES_DIR="$GUARDIAN_DIR/rules"
+WRAPPERS_DIR="/usr/local/bin"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+usage() {
+  echo ""
+  echo -e "  ${CYAN}guardian${NC} - Command protection manager"
+  echo ""
+  echo -e "  ${YELLOW}Usage:${NC}"
+  echo "    guardian init                     Set password (first time only)"
+  echo "    guardian add <cmd> <sub> [ctx]    Block a subcommand"
+  echo "    guardian remove <cmd> <sub>       Remove a block (requires password)"
+  echo "    guardian list                     Show all blocked commands"
+  echo "    guardian status                   Show protection status"
+  echo "    guardian test <cmd> <sub>         Test if a command is blocked"
+  echo ""
+  echo -e "  ${YELLOW}Context options:${NC}"
+  echo "    any                    Block everywhere (default)"
+  echo "    branch:<name>          Block only on specific branch"
+  echo "    env:<KEY>=<VAL>        Block when env var is set"
+  echo "    flag:<flag>            Block when flag is used"
+  echo ""
+  echo -e "  ${YELLOW}Examples:${NC}"
+  echo "    sudo guardian add git commit branch:dev"
+  echo "    sudo guardian add git push branch:main"
+  echo "    sudo guardian add npm install any"
+  echo "    sudo guardian add gh 'pr merge' any"
+  echo "    sudo guardian remove git commit     # requires password"
+  echo ""
+}
+
+check_init() {
+  if [[ ! -f "$CONFIG" ]]; then
+    echo ""
+    echo -e "  ${RED}⛔ Guardian is not initialized.${NC}"
+    echo "  Run: sudo guardian init"
+    echo ""
+    exit 1
+  fi
+}
+
+verify_password() {
+  read -s -p "  🔒 Guardian password: " password
+  echo ""
+  INPUT_HASH=$(echo -n "$password" | sha256sum | cut -d" " -f1)
+  EXPECTED=$(cat "$CONFIG" 2>/dev/null)
+
+  if [[ "$INPUT_HASH" != "$EXPECTED" ]]; then
+    echo -e "  ${RED}❌ Wrong password.${NC}"
+    exit 1
+  fi
+}
+
+do_init() {
+  if [[ "$EUID" -ne 0 ]]; then
+    echo "  ⛔ Run with sudo: sudo guardian init"
+    exit 1
+  fi
+
+  if [[ -f "$CONFIG" ]]; then
+    echo ""
+    echo -e "  ${YELLOW}Guardian is already initialized.${NC}"
+    echo "  Password cannot be changed (by design)."
+    echo ""
+    exit 1
+  fi
+
+  echo ""
+  echo -e "  ${CYAN}🔒 Guardian Setup${NC}"
+  echo ""
+  read -s -p "  Choose password: " pw1
+  echo ""
+  read -s -p "  Confirm password: " pw2
+  echo ""
+
+  if [[ "$pw1" != "$pw2" ]]; then
+    echo -e "  ${RED}❌ Passwords don't match!${NC}"
+    exit 1
+  fi
+
+  if [[ -z "$pw1" ]]; then
+    echo -e "  ${RED}❌ Password cannot be empty!${NC}"
+    exit 1
+  fi
+
+  mkdir -p "$GUARDIAN_DIR" "$RULES_DIR"
+
+  HASH=$(echo -n "$pw1" | sha256sum | cut -d" " -f1)
+  echo "$HASH" > "$CONFIG"
+  chmod 600 "$CONFIG"
+  chown root:root "$CONFIG"
+  chown -R root:root "$GUARDIAN_DIR"
+
+  echo ""
+  echo -e "  ${GREEN}✅ Guardian initialized!${NC}"
+  echo ""
+}
+
+rebuild_wrapper() {
+  local cmd="$1"
+  local rules_file="$RULES_DIR/$cmd"
+  local real_path=""
+
+  # Find the real binary
+  for p in "/usr/local/bin/.$cmd-real" "/usr/bin/.$cmd-real" "/usr/bin/$cmd" "/bin/$cmd" "/home/linuxbrew/.linuxbrew/bin/$cmd"; do
+    if [[ -f "$p" ]]; then
+      # Skip if it's a guardian wrapper
+      if head -1 "$p" 2>/dev/null | grep -q "Guardian"; then
+        continue
+      fi
+      real_path="$p"
+      break
+    fi
+  done
+
+  if [[ -z "$real_path" ]]; then
+    echo -e "  ${RED}❌ Cannot find real binary for '$cmd'${NC}"
+    return 1
+  fi
+
+  # Move real binary to hidden location if needed
+  local hidden="/usr/local/bin/.$cmd-real"
+  if [[ "$real_path" != "$hidden" ]]; then
+    if [[ "$real_path" == "/home/linuxbrew/.linuxbrew/bin/$cmd" ]]; then
+      cp "$real_path" "$hidden"
+    else
+      mv "$real_path" "$hidden"
+    fi
+    real_path="$hidden"
+  fi
+
+  local wrapper="$WRAPPERS_DIR/$cmd"
+
+  cat > "$wrapper" << HEADER
+#!/bin/bash
+# Guardian-managed wrapper for '$cmd'
+# DO NOT EDIT - managed by guardian
+
+REAL_CMD="$real_path"
+GUARDIAN_RULES="$rules_file"
+
+HEADER
+
+  cat >> "$wrapper" << 'LOGIC'
+# Parse subcommand (skip global flags)
+subcmd=""
+subcmd2=""
+skip_next=""
+
+for arg in "$@"; do
+  if [[ -n "$skip_next" ]]; then
+    skip_next=""
+    continue
+  fi
+  case "$arg" in
+    -c|-C|--git-dir|--work-tree|--config-env|--namespace|--super-prefix)
+      skip_next=1; continue ;;
+    -c*) continue ;;
+    -*) continue ;;
+    *)
+      if [[ -z "$subcmd" ]]; then
+        subcmd="$arg"
+      elif [[ -z "$subcmd2" ]]; then
+        subcmd2="$arg"
+      fi
+      ;;
+  esac
+done
+
+if [[ -f "$GUARDIAN_RULES" ]]; then
+  while IFS='|' read -r blocked_sub blocked_context blocked_msg; do
+    [[ "$blocked_sub" == "#"* || -z "$blocked_sub" ]] && continue
+
+    match=0
+
+    # Multi-word subcommand (e.g. "pr merge")
+    if [[ "$blocked_sub" == *" "* ]]; then
+      word1="${blocked_sub%% *}"
+      word2="${blocked_sub#* }"
+      if [[ "$subcmd" == "$word1" && "$subcmd2" == "$word2" ]]; then
+        match=1
+      fi
+    else
+      if [[ "$subcmd" == "$blocked_sub" ]]; then
+        match=1
+      fi
+    fi
+
+    if [[ "$match" == "1" ]]; then
+      if [[ -n "$blocked_context" && "$blocked_context" != "any" ]]; then
+        case "$blocked_context" in
+          branch:*)
+            branch_name="${blocked_context#branch:}"
+            current=$("$REAL_CMD" rev-parse --abbrev-ref HEAD 2>/dev/null)
+            [[ "$current" != "$branch_name" ]] && continue
+            ;;
+          env:*)
+            env_check="${blocked_context#env:}"
+            env_key="${env_check%%=*}"
+            env_val="${env_check#*=}"
+            [[ "${!env_key:-}" != "$env_val" ]] && continue
+            ;;
+          flag:*)
+            flag="${blocked_context#flag:}"
+            found=0
+            for a in "$@"; do [[ "$a" == "$flag" ]] && found=1; done
+            [[ "$found" == "0" ]] && continue
+            ;;
+        esac
+      fi
+
+      echo ""
+      echo -e "  \033[0;31m⛔ Blocked by Guardian\033[0m"
+      if [[ -n "$blocked_msg" ]]; then
+        echo -e "  $blocked_msg"
+      else
+        echo -e "  Command '$blocked_sub' is not allowed."
+      fi
+      echo ""
+      exit 1
+    fi
+  done < "$GUARDIAN_RULES"
+fi
+
+exec "$REAL_CMD" "$@"
+LOGIC
+
+  chmod 755 "$wrapper"
+  chown root:root "$wrapper"
+}
+
+do_add() {
+  if [[ "$EUID" -ne 0 ]]; then
+    echo "  ⛔ Run with sudo: sudo guardian add $*"
+    exit 1
+  fi
+
+  check_init
+
+  local cmd="$1"
+  local subcmd="$2"
+  local context="${3:-any}"
+  local msg="${4:-}"
+
+  if [[ -z "$cmd" || -z "$subcmd" || -z "$msg" ]]; then
+    echo ""
+    echo -e "  ${YELLOW}Usage:${NC} sudo guardian add <command> <subcommand> <context> <error message>"
+    echo ""
+    echo -e "  ${YELLOW}Examples:${NC}"
+    echo "    sudo guardian add git commit branch:dev \"Direct commits to dev are not allowed. Use a feature branch.\""
+    echo "    sudo guardian add npm install any \"npm install is blocked on WSL. Run from PowerShell on Windows.\""
+    echo "    sudo guardian add gh 'pr merge' any \"Merge requires Adi's explicit approval.\""
+    echo ""
+    exit 1
+  fi
+
+  local rules_file="$RULES_DIR/$cmd"
+  touch "$rules_file"
+
+  # Check duplicate
+  if grep -q "^${subcmd}|${context}|" "$rules_file" 2>/dev/null; then
+    echo -e "  ${YELLOW}Rule already exists.${NC}"
+    exit 0
+  fi
+
+  echo "${subcmd}|${context}|${msg}" >> "$rules_file"
+  chown root:root "$rules_file"
+  chmod 644 "$rules_file"
+
+  rebuild_wrapper "$cmd"
+
+  echo ""
+  echo -e "  ${GREEN}✅ Added:${NC} $cmd $subcmd ($context)"
+  echo ""
+}
+
+do_remove() {
+  if [[ "$EUID" -ne 0 ]]; then
+    echo "  ⛔ Run with sudo: sudo guardian remove $*"
+    exit 1
+  fi
+
+  check_init
+
+  local cmd="$1"
+  local subcmd="$2"
+
+  if [[ -z "$cmd" || -z "$subcmd" ]]; then
+    echo ""
+    echo -e "  ${YELLOW}Usage:${NC} sudo guardian remove <command> <subcommand>"
+    echo ""
+    exit 1
+  fi
+
+  echo ""
+  verify_password
+
+  local rules_file="$RULES_DIR/$cmd"
+
+  if [[ ! -f "$rules_file" ]]; then
+    echo -e "  ${YELLOW}No rules found for '$cmd'${NC}"
+    exit 1
+  fi
+
+  # Remove matching lines
+  local before=$(wc -l < "$rules_file")
+  grep -v "^${subcmd}|" "$rules_file" > "${rules_file}.tmp"
+  mv "${rules_file}.tmp" "$rules_file"
+  local after=$(wc -l < "$rules_file")
+
+  if [[ "$before" == "$after" ]]; then
+    echo -e "  ${YELLOW}Rule not found: $cmd $subcmd${NC}"
+    exit 1
+  fi
+
+  rebuild_wrapper "$cmd"
+
+  echo ""
+  echo -e "  ${GREEN}✅ Removed:${NC} $cmd $subcmd"
+  echo ""
+}
+
+do_list() {
+  check_init
+  echo ""
+  echo -e "  ${CYAN}🛡️  Guardian Rules${NC}"
+  echo ""
+
+  if [[ ! -d "$RULES_DIR" ]] || [[ -z "$(ls -A "$RULES_DIR" 2>/dev/null)" ]]; then
+    echo "  No rules configured."
+    echo ""
+    return
+  fi
+
+  for rules_file in "$RULES_DIR"/*; do
+    local cmd=$(basename "$rules_file")
+    echo -e "  ${YELLOW}$cmd:${NC}"
+    while IFS='|' read -r subcmd context msg; do
+      [[ "$subcmd" == "#"* || -z "$subcmd" ]] && continue
+      local ctx_display="$context"
+      [[ "$context" == "any" ]] && ctx_display="all branches"
+      echo -e "    ❌ ${RED}$subcmd${NC} ($ctx_display)"
+    done < "$rules_file"
+    echo ""
+  done
+}
+
+do_status() {
+  echo ""
+  echo -e "  ${CYAN}🛡️  Guardian Status${NC}"
+  echo ""
+
+  if [[ -f "$CONFIG" ]]; then
+    echo -e "  ${GREEN}✅ Initialized${NC}"
+  else
+    echo -e "  ${RED}❌ Not initialized${NC} (run: sudo guardian init)"
+    echo ""
+    return
+  fi
+
+  local rule_count=0
+  if [[ -d "$RULES_DIR" ]]; then
+    for f in "$RULES_DIR"/*; do
+      [[ -f "$f" ]] && rule_count=$((rule_count + $(grep -cv '^#\|^$' "$f" 2>/dev/null || echo 0)))
+    done
+  fi
+  echo -e "  Rules: ${YELLOW}$rule_count${NC}"
+  echo ""
+}
+
+do_test() {
+  local cmd="$1"
+  local subcmd="$2"
+
+  if [[ -z "$cmd" || -z "$subcmd" ]]; then
+    echo "  Usage: guardian test <cmd> <subcmd>"
+    exit 1
+  fi
+
+  local rules_file="$RULES_DIR/$cmd"
+  if [[ ! -f "$rules_file" ]] || ! grep -q "^${subcmd}|" "$rules_file" 2>/dev/null; then
+    echo -e "  ${GREEN}✅ '$cmd $subcmd' is allowed${NC}"
+  else
+    echo -e "  ${RED}❌ '$cmd $subcmd' is BLOCKED${NC}"
+  fi
+}
+
+case "${1:-}" in
+  init)     do_init ;;
+  add)      shift; do_add "$@" ;;
+  remove)   shift; do_remove "$@" ;;
+  list)     do_list ;;
+  status)   do_status ;;
+  test)     shift; do_test "$@" ;;
+  *)        usage ;;
+esac
