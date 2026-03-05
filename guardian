@@ -103,8 +103,16 @@ do_init() {
   chown root:root "$CONFIG"
   chown -R root:root "$GUARDIAN_DIR"
 
+  # Add sudoers rule so 'sudo guardian' works without password
+  local current_user="${SUDO_USER:-$(whoami)}"
+  local sudoers_file="/etc/sudoers.d/guardian"
+  echo "$current_user ALL=(root) NOPASSWD: /usr/local/bin/guardian" > "$sudoers_file"
+  chmod 440 "$sudoers_file"
+  chown root:root "$sudoers_file"
+
   echo ""
   echo -e "  ${GREEN}✅ Guardian initialized!${NC}"
+  echo -e "  ${GREEN}✅ sudo guardian works without password for '$current_user'${NC}"
   echo ""
 }
 
