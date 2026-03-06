@@ -31,6 +31,7 @@ usage() {
   echo "    branch:<name>          Block only on specific branch"
   echo "    env:<KEY>=<VAL>        Block when env var is set"
   echo "    flag:<flag>            Block when flag is used"
+  echo "    arg:<text>             Block when any argument contains text"
   echo ""
   echo -e "  ${YELLOW}Examples:${NC}"
   echo "    sudo guardian add git commit branch:dev"
@@ -52,8 +53,12 @@ check_init() {
 }
 
 verify_password() {
-  read -s -p "  🔒 Guardian password: " password
-  echo ""
+  if [ -t 0 ]; then
+    read -s -p "  🔒 Guardian password: " password
+    echo ""
+  else
+    read -r password
+  fi
   INPUT_HASH=$(echo -n "$password" | sha256sum | cut -d" " -f1)
   EXPECTED=$(cat "$CONFIG" 2>/dev/null)
 
@@ -142,6 +147,9 @@ rebuild_wrapper() {
 
     if [[ -z "$real_path" ]]; then
       echo -e "  ${RED}❌ Cannot find real binary for '$cmd'${NC}"
+      echo -e "  ${YELLOW}Searched: which $cmd, /usr/bin/$cmd, /bin/$cmd, linuxbrew, .${cmd}-real${NC}"
+      echo -e "  ${YELLOW}The binary must be in PATH or a standard location to create a wrapper.${NC}"
+      echo -e "  ${YELLOW}Rule was saved but no wrapper was created.${NC}"
       return 1
     fi
 
@@ -264,7 +272,17 @@ if [[ -f "$GUARDIAN_RULES" ]]; then
           branch:*)
             branch_name="${blocked_context#branch:}"
             current=$("$REAL_CMD" rev-parse --abbrev-ref HEAD 2>/dev/null)
-            [[ "$current" != "$branch_name" ]] && continue
+            # For push: also check refspec targets (e.g. "push origin trick:dev")
+            refspec_match=0
+            if [[ "$subcmd" == "push" ]]; then
+              for a in "$@"; do
+                # Match ":dev" or ":refs/heads/dev" in refspec
+                if [[ "$a" == *":${branch_name}" || "$a" == *":refs/heads/${branch_name}" ]]; then
+                  refspec_match=1
+                fi
+              done
+            fi
+            [[ "$current" != "$branch_name" && "$refspec_match" == "0" ]] && continue
             ;;
           env:*)
             env_check="${blocked_context#env:}"
@@ -276,6 +294,12 @@ if [[ -f "$GUARDIAN_RULES" ]]; then
             flag="${blocked_context#flag:}"
             found=0
             for a in "$@"; do [[ "$a" == "$flag" ]] && found=1; done
+            [[ "$found" == "0" ]] && continue
+            ;;
+          arg:*)
+            pattern="${blocked_context#arg:}"
+            found=0
+            for a in "$@"; do [[ "$a" == *"$pattern"* ]] && found=1; done
             [[ "$found" == "0" ]] && continue
             ;;
         esac
@@ -339,11 +363,15 @@ do_add() {
   chown root:root "$rules_file"
   chmod 644 "$rules_file"
 
-  rebuild_wrapper "$cmd"
-
-  echo ""
-  echo -e "  ${GREEN}✅ Added:${NC} $cmd $subcmd ($context)"
-  echo ""
+  if ! rebuild_wrapper "$cmd"; then
+    echo ""
+    echo -e "  ${YELLOW}⚠️  Rule saved but wrapper not created (binary not found).${NC}"
+    echo ""
+  else
+    echo ""
+    echo -e "  ${GREEN}✅ Added:${NC} $cmd $subcmd ($context)"
+    echo ""
+  fi
 }
 
 do_remove() {
@@ -433,7 +461,11 @@ do_status() {
   local rule_count=0
   if [[ -d "$RULES_DIR" ]]; then
     for f in "$RULES_DIR"/*; do
-      [[ -f "$f" ]] && rule_count=$((rule_count + $(grep -cv '^#\|^$' "$f" 2>/dev/null || echo 0)))
+      if [[ -f "$f" ]]; then
+        local count
+        count=$(grep -cv '^#\|^$' "$f" 2>/dev/null) || count=0
+        rule_count=$((rule_count + count))
+      fi
     done
   fi
   echo -e "  Rules: ${YELLOW}$rule_count${NC}"
@@ -477,11 +509,45 @@ do_rebuild() {
   echo ""
 }
 
+do_passwd() {
+  if [[ "$EUID" -ne 0 ]]; then
+    echo "  ⛔ Run with sudo: sudo guardian passwd"
+    exit 1
+  fi
+  check_init
+
+  echo ""
+  verify_password
+
+  read -s -p "  New password: " pw1
+  echo ""
+  read -s -p "  Confirm new password: " pw2
+  echo ""
+
+  if [[ "$pw1" != "$pw2" ]]; then
+    echo -e "  ${RED}❌ Passwords don't match!${NC}"
+    exit 1
+  fi
+  if [[ -z "$pw1" ]]; then
+    echo -e "  ${RED}❌ Password cannot be empty!${NC}"
+    exit 1
+  fi
+
+  local HASH
+  HASH=$(echo -n "$pw1" | sha256sum | cut -d" " -f1)
+  echo "$HASH" > "$CONFIG"
+
+  echo ""
+  echo -e "  ${GREEN}✅ Password changed.${NC}"
+  echo ""
+}
+
 case "${1:-}" in
   init)     do_init ;;
   add)      shift; do_add "$@" ;;
   remove)   shift; do_remove "$@" ;;
   rebuild)  do_rebuild ;;
+  passwd)   do_passwd ;;
   list)     do_list ;;
   status)   do_status ;;
   test)     shift; do_test "$@" ;;
