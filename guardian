@@ -157,6 +157,49 @@ rebuild_wrapper() {
     chown root:root "$actual"
   fi
 
+  # Replace ALL other copies of this binary with symlinks to our wrapper.
+  # Uses dpkg (Debian/Ubuntu) to find every file installed by the package that owns the binary.
+  # Falls back to common paths on non-dpkg systems.
+  local wrapper_path="$WRAPPERS_DIR/$cmd"
+  local alt_paths=()
+
+  # Strategy 1: Ask the package manager
+  if command -v dpkg &>/dev/null; then
+    # Find which package owns this command
+    local pkg
+    pkg=$(dpkg -S "*/bin/$cmd" 2>/dev/null | head -1 | cut -d: -f1)
+    if [[ -n "$pkg" ]]; then
+      # Get ALL executable files from that package matching the command name
+      while IFS= read -r p; do
+        [[ -f "$p" && -x "$p" ]] && alt_paths+=("$p")
+      done < <(dpkg -L "$pkg" 2>/dev/null | grep "/$cmd$")
+    fi
+  fi
+
+  # Strategy 2 (fallback): Common paths
+  for p in "/usr/bin/$cmd" "/bin/$cmd" "/usr/lib/${cmd}-core/$cmd"; do
+    [[ -f "$p" || -L "$p" ]] && alt_paths+=("$p")
+  done
+
+  # Deduplicate and process
+  local seen=""
+  for alt in "${alt_paths[@]}"; do
+    # Skip duplicates
+    echo "$seen" | grep -qxF "$alt" && continue
+    seen="$seen
+$alt"
+    # Skip our own wrapper and actual binary
+    [[ "$alt" == "$wrapper_path" ]] && continue
+    [[ "$alt" == "$actual" ]] && continue
+    # Skip if already a symlink to our wrapper
+    [[ -L "$alt" ]] && [[ "$(readlink -f "$alt")" == "$wrapper_path" ]] && continue
+    # Replace with symlink
+    if [[ -f "$alt" && ! -L "$alt" ]]; then
+      mv "$alt" "${alt}.guardian-bak"
+    fi
+    ln -sf "$wrapper_path" "$alt"
+  done
+
   local wrapper="$WRAPPERS_DIR/$cmd"
 
   cat > "$wrapper" << HEADER
