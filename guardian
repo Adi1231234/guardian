@@ -196,6 +196,7 @@ $alt"
     # Replace with symlink
     if [[ -f "$alt" && ! -L "$alt" ]]; then
       mv "$alt" "${alt}.guardian-bak"
+      chmod 700 "${alt}.guardian-bak"
     fi
     ln -sf "$wrapper_path" "$alt"
   done
