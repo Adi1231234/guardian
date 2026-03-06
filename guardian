@@ -122,31 +122,39 @@ rebuild_wrapper() {
   local real_path=""
 
   # Find the real binary
-  for p in "/usr/local/bin/.$cmd-real" "/usr/bin/.$cmd-real" "/usr/bin/$cmd" "/bin/$cmd" "/home/linuxbrew/.linuxbrew/bin/$cmd"; do
-    if [[ -f "$p" ]]; then
-      # Skip if it's a guardian wrapper
-      if head -1 "$p" 2>/dev/null | grep -q "Guardian"; then
-        continue
-      fi
-      real_path="$p"
-      break
+  local actual="/usr/local/bin/.$cmd-actual"
+
+  # If already secured from a previous add, skip
+  if [[ ! -f "$actual" ]]; then
+    # Find the real binary using which (skipping guardian wrappers)
+    real_path=$(which "$cmd" 2>/dev/null)
+
+    # If which returns our own wrapper, look deeper
+    if [[ -z "$real_path" ]] || head -1 "$real_path" 2>/dev/null | grep -qi "guardian"; then
+      # Try common paths as fallback
+      for p in "/usr/bin/$cmd" "/bin/$cmd" "/home/linuxbrew/.linuxbrew/bin/$cmd" "/usr/local/bin/.$cmd-real"; do
+        if [[ -f "$p" ]] && ! head -1 "$p" 2>/dev/null | grep -qi "guardian"; then
+          real_path="$p"
+          break
+        fi
+      done
     fi
-  done
 
-  if [[ -z "$real_path" ]]; then
-    echo -e "  ${RED}❌ Cannot find real binary for '$cmd'${NC}"
-    return 1
-  fi
+    if [[ -z "$real_path" ]]; then
+      echo -e "  ${RED}❌ Cannot find real binary for '$cmd'${NC}"
+      return 1
+    fi
 
-  # Move real binary to hidden location if needed
-  local hidden="/usr/local/bin/.$cmd-real"
-  if [[ "$real_path" != "$hidden" ]]; then
-    if [[ "$real_path" == "/home/linuxbrew/.linuxbrew/bin/$cmd" ]]; then
-      cp "$real_path" "$hidden"
+    # Move/copy real binary to secured location
+    if [[ "$real_path" == *"linuxbrew"* || "$real_path" == *"/.npm-global/"* ]]; then
+      cp "$real_path" "$actual"
     else
-      mv "$real_path" "$hidden"
+      mv "$real_path" "$actual"
     fi
-    real_path="$hidden"
+
+    # Root-owned but world-executable (hidden name is the protection)
+    chmod 755 "$actual"
+    chown root:root "$actual"
   fi
 
   local wrapper="$WRAPPERS_DIR/$cmd"
@@ -156,7 +164,7 @@ rebuild_wrapper() {
 # Guardian-managed wrapper for '$cmd'
 # DO NOT EDIT - managed by guardian
 
-REAL_CMD="$real_path"
+REAL_CMD="$actual"
 GUARDIAN_RULES="$rules_file"
 
 HEADER
@@ -405,10 +413,31 @@ do_test() {
   fi
 }
 
+do_rebuild() {
+  if [[ "$EUID" -ne 0 ]]; then
+    echo "  ⛔ Run with sudo: sudo guardian rebuild"
+    exit 1
+  fi
+  check_init
+
+  if [[ ! -d "$RULES_DIR" ]] || [[ -z "$(ls -A "$RULES_DIR" 2>/dev/null)" ]]; then
+    echo -e "  ${YELLOW}No rules to rebuild.${NC}"
+    return
+  fi
+
+  for rules_file in "$RULES_DIR"/*; do
+    local cmd=$(basename "$rules_file")
+    rebuild_wrapper "$cmd"
+    echo -e "  ${GREEN}✅ Rebuilt wrapper: $cmd${NC}"
+  done
+  echo ""
+}
+
 case "${1:-}" in
   init)     do_init ;;
   add)      shift; do_add "$@" ;;
   remove)   shift; do_remove "$@" ;;
+  rebuild)  do_rebuild ;;
   list)     do_list ;;
   status)   do_status ;;
   test)     shift; do_test "$@" ;;
